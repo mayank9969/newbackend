@@ -2,6 +2,9 @@ import json
 import os   
 import random 
 import re
+import copy
+import shutil
+import unicodedata
 import tkinter as tk
 from tkinter import messagebox, simpledialog
 from datetime import date, timedelta
@@ -9,6 +12,32 @@ from datetime import datetime
 from fractions import Fraction
 from tkinter import filedialog
 import uuid
+
+
+def write_json_atomically(path, data, keep_backup=False):
+    """Write JSON safely; optionally preserve the previous valid file as .bak."""
+    temporary_path = path + ".tmp"
+    try:
+        with open(temporary_path, "w", encoding="utf-8") as output:
+            json.dump(data, output, indent=4, ensure_ascii=False)
+            output.flush()
+            os.fsync(output.fileno())
+        if keep_backup and os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as previous_file:
+                    json.load(previous_file)
+                shutil.copy2(path, path + ".bak")
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                pass
+        os.replace(temporary_path, path)
+        return None
+    except (OSError, TypeError, ValueError) as error:
+        try:
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+        except OSError:
+            pass
+        return str(error)
 
 
 def parse_feedback_criteria(raw_text):
@@ -40,7 +69,7 @@ def choose_question_file(save=False):
 
 
 class Question:
-    def __init__(self,question,answer,category,difficulty,question_type,options=None,explanation="",feedback_criteria=None):
+    def __init__(self,question,answer,category,difficulty,question_type,options=None,explanation="",feedback_criteria=None,skill_tags=None):
         self.question = question 
         self.answer = answer 
         self.category = category 
@@ -54,6 +83,12 @@ class Question:
             for criterion in raw_criteria
             if isinstance(criterion, list) and any(str(alias).strip() for alias in criterion)
         ]
+        if isinstance(skill_tags, str):
+            skill_tags = [tag.strip() for tag in skill_tags.split(",")]
+        self.skill_tags = list(dict.fromkeys(
+            str(tag).strip() for tag in (skill_tags or [])
+            if isinstance(tag, str) and tag.strip()
+        ))
     def __str__(self): 
         return f"{self.question},{self.answer},{self.category},{self.difficulty},{self.question_type},{self.options}" 
     def to_dictionary(self): 
@@ -66,6 +101,7 @@ class Question:
             "options":self.options,
             "explanation":self.explanation,
             "feedback_criteria":self.feedback_criteria,
+            "skill_tags":self.skill_tags,
  
         } 
         return data 
@@ -129,30 +165,51 @@ class Question_bank:
             self.questions[question.category][question.difficulty].remove(question)    
             print("the question has been removed ") 
     def load_questions(self):
-            self.questions =  {}
-            
-            
- 
-            if not os.path.exists("questions.json"): 
-                with open("questions.json", "w", encoding="utf-8") as f: 
-                    json.dump({}, f) 
-            with open("questions.json","r", encoding="utf-8")as f: 
-                question_data = json.load(f) 
-                     
-                for category in question_data: 
-                    for difficulty in question_data[category]: 
-                        for question_dict in question_data[category][difficulty]: 
-                            question = Question( 
-                                                question_dict["question"], 
-                                                question_dict["answer"], 
-                                                category, 
-                                                difficulty, 
-                                                question_dict["question_type"], 
-                                                question_dict.get("options"),
-                                                question_dict.get("explanation", ""),
-                                                question_dict.get("feedback_criteria", []),
-                                                                            ) 
-                            self.add_question(question) 
+            question_data = None
+            paths = [path for path in ("questions.json", "questions.json.bak") if os.path.exists(path)]
+            for path in paths:
+                try:
+                    with open(path, "r", encoding="utf-8") as question_file:
+                        candidate = json.load(question_file)
+                    if isinstance(candidate, dict):
+                        question_data = candidate
+                        break
+                except (OSError, json.JSONDecodeError, UnicodeError):
+                    continue
+            if question_data is None:
+                if paths:
+                    raise ValueError("The question bank and its backup could not be read; both files were left unchanged.")
+                question_data = {}
+                error = write_json_atomically("questions.json", question_data)
+                if error:
+                    raise OSError(f"Could not create the question bank: {error}")
+
+            loaded_questions = {}
+            for category, difficulty_groups in question_data.items():
+                if not isinstance(difficulty_groups, dict):
+                    continue
+                for difficulty, question_list in difficulty_groups.items():
+                    if not isinstance(question_list, list):
+                        continue
+                    for question_dict in question_list:
+                        if not isinstance(question_dict, dict):
+                            continue
+                        required = (question_dict.get("question"), question_dict.get("answer"), question_dict.get("question_type"))
+                        if not all(isinstance(value, str) for value in required):
+                            continue
+                        question = Question(
+                            question_dict["question"],
+                            question_dict["answer"],
+                            category,
+                            difficulty,
+                            question_dict["question_type"],
+                            question_dict.get("options"),
+                            question_dict.get("explanation", ""),
+                            question_dict.get("feedback_criteria", []),
+                            question_dict.get("skill_tags", []),
+                        )
+                        loaded_questions.setdefault(category, {}).setdefault(difficulty, []).append(question)
+            self.questions = loaded_questions
                            
                              
  
@@ -172,6 +229,10 @@ class Question_bank:
                 question.explanation = new_value.strip()
             elif field == "feedback_criteria":
                 question.feedback_criteria = new_value
+            elif field == "skill_tags":
+                question.skill_tags = list(dict.fromkeys(
+                    str(tag).strip() for tag in new_value if str(tag).strip()
+                ))
             elif field == "category": 
                 new_category,new_difficulty = new_value 
                 self.questions[question.category][question.difficulty].remove(question) 
@@ -252,8 +313,9 @@ class Question_bank:
  
     def save_questions(self): 
         data = self.to_dictionary()
-        with open("questions.json", "w", encoding="utf-8") as question_file:
-            json.dump(data, question_file, indent=4, ensure_ascii=False)
+        error = write_json_atomically("questions.json", data, keep_backup=True)
+        if error:
+            raise OSError(f"Could not safely save questions: {error}")
 
     def to_dictionary(self):
         data = {} 
@@ -318,6 +380,7 @@ class Question_bank:
                         options,
                         item.get("explanation") or "",
                         item.get("feedback_criteria", []),
+                        item.get("skill_tags", []),
                     ))
                     existing.add(identity)
 
@@ -372,6 +435,8 @@ bank =Question_bank()
 class Quiz: 
     QUESTION_TIME_LIMIT = 30
     OPINION_HISTORY_FILE = "opinion_responses.json"
+    CONCEPT_PROGRESS_FILE = "concept_progress.json"
+    CONCEPTS_FILE = "concepts.json"
     MISTAKE_PATTERN_LABELS = {
         "concept_gap": "Concept not clear",
         "working_slip": "Calculation or working slip",
@@ -380,6 +445,66 @@ class Quiz:
         "answer_format": "Answer format or wording",
         "other": "Something else",
         "not_sure": "Not sure",
+    }
+    CONCEPT_LIBRARY = {
+        "maths": [
+            {
+                "id": "maths-algebra-balance",
+                "title": "Equations as a balance",
+                "analogy": "Think of an equation as a balanced scale. Whatever you do to one side, do to the other so it stays level.",
+                "idea": "In 3x + 5 = 20, undo the +5 first, then undo the multiplication by 3. That gives 3x = 15 and x = 5.",
+                "example": "A box holds x pencils. Three boxes and five loose pencils make 20. Removing the five loose pencils leaves 15, so each box holds 5.",
+                "visual": "balance",
+                "check": {"prompt": "Solve 2x + 4 = 14.", "choices": ["x = 5", "x = 9", "x = 18"], "answer": 0, "why": "Subtract 4 from both sides to get 2x = 10, then divide both sides by 2."},
+            },
+            {
+                "id": "maths-derivative-slope",
+                "title": "A derivative is a changing slope",
+                "analogy": "A car’s speedometer shows speed at this instant. A derivative does the same for a changing quantity: it measures the curve’s slope at one point.",
+                "idea": "For y = x², the slope at x is 2x. At x = 3, the curve is rising at slope 6. The tangent line is the straight line that just matches the curve there.",
+                "example": "Near x = 3, a small increase of 0.1 in x changes x² by about 0.6, because the local slope is about 6.",
+                "visual": "derivative",
+                "check": {"prompt": "For y = x², what is the slope at x = 2?", "choices": ["2", "4", "8"], "answer": 1, "why": "The derivative is 2x, so at x = 2 the slope is 4."},
+            },
+            {
+                "id": "maths-functions-machine",
+                "title": "Functions as input-output machines",
+                "analogy": "A function is like a vending machine: put in an input, follow one fixed rule, and get the corresponding output.",
+                "idea": "For f(x) = 2x + 1, the rule doubles the input and adds one. Use the same rule each time; different inputs can produce different outputs.",
+                "example": "If x = 3, then f(3) = 2(3) + 1 = 7. The input is 3; the output is 7.",
+                "visual": "function",
+                "check": {"prompt": "If f(x) = 2x + 1, what is f(4)?", "choices": ["8", "9", "10"], "answer": 1, "why": "Double 4 and add 1: 8 + 1 = 9."},
+            },
+        ],
+        "python": [
+            {
+                "id": "python-variables-boxes",
+                "title": "Variables are named boxes",
+                "analogy": "A variable name is a label pointing to a value. Reassigning the name changes what it points to; it does not rewrite the old value everywhere.",
+                "idea": "After score = 4 followed by score = score + 3, the name score refers to 7. The second line reads the old value, adds 3, then stores the result.",
+                "example": "level = 1; level = level + 1 leaves level equal to 2.",
+                "visual": "variables",
+                "check": {"prompt": "After count = 5; count = count + 2, what is count?", "choices": ["5", "7", "52"], "answer": 1, "why": "The second assignment adds 2 to the current value 5, then stores 7."},
+            },
+            {
+                "id": "python-loops-repetition",
+                "title": "A loop repeats a small instruction",
+                "analogy": "A loop is like following a recipe step a set number of times. The loop variable tells you which turn you are on.",
+                "idea": "for i in range(3) runs with i equal to 0, then 1, then 2. The stop value 3 is excluded, so there are three turns.",
+                "example": "total = 0; for n in [2, 4, 6]: total += n ends with total equal to 12.",
+                "visual": "loop",
+                "check": {"prompt": "How many times does range(4) run in a for loop?", "choices": ["3", "4", "5"], "answer": 1, "why": "range(4) produces 0, 1, 2, and 3: four values."},
+            },
+            {
+                "id": "python-shared-list-alias",
+                "title": "Two names can point to one list",
+                "analogy": "Two labels can be attached to the same shared whiteboard. Changing the board through either label changes what both labels show.",
+                "idea": "If a = [1, 2] and b = a, both names refer to the same list. Calling b.append(3) changes that shared list, so a also shows [1, 2, 3].",
+                "example": "To make an independent copy, use b = a.copy(); then appending to b does not change a.",
+                "visual": "alias",
+                "check": {"prompt": "After a = [1]; b = a; b.append(2), what does a contain?", "choices": ["[1]", "[1, 2]", "[2]"], "answer": 1, "why": "Both names point to the same list, so the append is visible through a."},
+            },
+        ],
     }
     OPINION_PROMPTS = [
         ("Everyday life", "Should schools give students more choice in how they show what they have learned? Why or why not?"),
@@ -490,7 +615,18 @@ class Quiz:
             confidence = reflection["confidence"]
             mistake_pattern = reflection["mistake_pattern"]
             numeric_difference = self.get_numeric_difference(question, user_answer)
-            next_review_date = self.get_next_review_date(is_correct, confidence, was_retried=retried)
+            previous_review_streak = self.get_question_review_streak(question)
+            review_streak = (
+                previous_review_streak + 1
+                if is_correct and confidence == "sure" and not retried
+                else 0
+            )
+            next_review_date = self.get_next_review_date(
+                is_correct,
+                confidence,
+                was_retried=retried,
+                previous_streak=previous_review_streak,
+            )
             if is_correct: 
                 mark = self.get_marks(question) 
                 self.score += mark 
@@ -543,6 +679,7 @@ class Quiz:
                 "question": question.question,
                 "category": question.category,
                 "difficulty": question.difficulty,
+                "skill_tags": question.skill_tags,
                 "question_type": question.question_type,
                 "options": question.options,
                 "your_answer": submitted_answer,
@@ -561,6 +698,7 @@ class Quiz:
                 "answer_analysis": answer_analysis,
                 "confidence": confidence,
                 "next_review_date": next_review_date,
+                "review_streak": review_streak,
             })
             print("Correct!" if is_correct else "Not quite.")
         total_marks = self.get_total_marks() 
@@ -617,14 +755,8 @@ class Quiz:
 
     def get_adaptive_question_weights(self):
         """Increase selection odds for questions with unresolved recent errors."""
-        if not os.path.exists("history.json"):
-            return {}
-        try:
-            with open("history.json", "r", encoding="utf-8") as history_file:
-                history = json.load(history_file)
-        except (OSError, json.JSONDecodeError, UnicodeError):
-            return {}
-        if not isinstance(history, list):
+        history, error = self.load_quiz_history()
+        if error:
             return {}
 
         outcomes_by_question = {}
@@ -647,8 +779,16 @@ class Quiz:
                 if clean_correct:
                     break
                 unresolved_errors += 1
-            if unresolved_errors:
-                weights[identity] = 1 + min(unresolved_errors, 4) * 2
+            recent = outcomes[-5:]
+            recent_errors = sum(not item.get("is_correct", False) for item in recent)
+            recent_retries = sum(bool(item.get("retried")) for item in recent)
+            if unresolved_errors or recent_errors or recent_retries:
+                weights[identity] = (
+                    1
+                    + min(unresolved_errors, 4) * 2
+                    + recent_errors
+                    + recent_retries
+                )
         return weights
 
     def select_weighted_questions(self, questions, count):
@@ -704,10 +844,10 @@ class Quiz:
             questions_by_identity[identity] = question
             questions_by_text.setdefault(question.question, question)
 
-        if not os.path.exists("history.json"):
+        history, error = self.load_quiz_history()
+        if error:
+            print(error)
             return []
-        with open("history.json", "r", encoding="utf-8") as history_file:
-            history = json.load(history_file)
 
         missed_questions = {}
         for attempt in history:
@@ -756,10 +896,10 @@ class Quiz:
 
     def get_due_questions(self):
         """Return questions whose latest answer is scheduled for review or was missed historically."""
-        if not os.path.exists("history.json"):
+        history, error = self.load_quiz_history()
+        if error:
+            print(error)
             return []
-        with open("history.json", "r", encoding="utf-8") as history_file:
-            history = json.load(history_file)
 
         questions_by_identity = {
             (question.category, question.difficulty, question.question): question
@@ -816,12 +956,493 @@ class Quiz:
             mode="smart_review",
         )
 
+    @staticmethod
+    def question_skills(question):
+        return question.skill_tags or [f"{question.category} · {question.difficulty}"]
+
+    def get_skill_outcomes(self, history=None):
+        if history is None:
+            history, error = self.load_quiz_history()
+            if error:
+                return {}
+        outcomes = {}
+        for attempt in history:
+            if not isinstance(attempt, dict):
+                continue
+            for item in attempt.get("answer_review", []):
+                if not isinstance(item, dict):
+                    continue
+                skills = item.get("skill_tags") or [
+                    f"{item.get('category', attempt.get('category', 'Unknown'))} · "
+                    f"{item.get('difficulty', attempt.get('difficulty', 'Unknown'))}"
+                ]
+                if isinstance(skills, str):
+                    skills = [skills]
+                for skill in skills:
+                    outcomes.setdefault(skill, []).append(bool(item.get("is_correct")))
+        return outcomes
+
+    def load_concept_progress(self):
+        for path in (self.CONCEPT_PROGRESS_FILE, self.CONCEPT_PROGRESS_FILE + ".bak"):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as progress_file:
+                    progress = json.load(progress_file)
+                if isinstance(progress, dict):
+                    return progress, None
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+        if os.path.exists(self.CONCEPT_PROGRESS_FILE):
+            return {}, "Concept progress could not be read; the saved file was left unchanged."
+        return {}, None
+
+    def load_concept_library(self):
+        """Combine shipped lessons with valid user-authored lessons for any subject."""
+        library = {category: copy.deepcopy(lessons) for category, lessons in self.CONCEPT_LIBRARY.items()}
+        for path in (self.CONCEPTS_FILE, self.CONCEPTS_FILE + ".bak"):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as lesson_file:
+                    saved = json.load(lesson_file)
+                if not isinstance(saved, dict):
+                    continue
+                for category, lessons in saved.items():
+                    if not isinstance(category, str) or not category.strip() or not isinstance(lessons, list):
+                        continue
+                    bucket = library.setdefault(category.strip().casefold(), [])
+                    known_ids = {lesson.get("id") for lesson in bucket}
+                    for lesson in lessons:
+                        if not isinstance(lesson, dict):
+                            continue
+                        check = lesson.get("check")
+                        if not all(isinstance(lesson.get(key), str) and lesson[key].strip()
+                                   for key in ("id", "title", "analogy", "idea", "example")):
+                            continue
+                        if (not isinstance(check, dict)
+                                or not isinstance(check.get("prompt"), str)
+                                or not isinstance(check.get("choices"), list)
+                                or len(check["choices"]) < 2
+                                or not all(isinstance(choice, str) for choice in check["choices"])
+                                or not isinstance(check.get("answer"), int)
+                                or not 0 <= check["answer"] < len(check["choices"])
+                                or not isinstance(check.get("why"), str)):
+                            continue
+                        lesson = dict(lesson)
+                        if lesson.get("visual") not in ("steps", "balance", "function", "derivative", "variables", "loop", "alias"):
+                            lesson["visual"] = "steps"
+                        steps = lesson.get("visual_steps")
+                        lesson["visual_steps"] = (
+                            [step for step in steps if isinstance(step, str) and step.strip()]
+                            if isinstance(steps, list) else []
+                        )
+                        if lesson["id"] not in known_ids:
+                            bucket.append(lesson)
+                            known_ids.add(lesson["id"])
+                return library, None
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+        if os.path.exists(self.CONCEPTS_FILE) or os.path.exists(self.CONCEPTS_FILE + ".bak"):
+            return library, "The saved concept library could not be read. It was left unchanged."
+        return library, None
+
+    def manage_concept_lessons(self):
+        """Add curated lessons for current or future question categories."""
+        library, error = self.load_concept_library()
+        if error:
+            print(error)
+            return
+        categories = sorted(self.question_bank.questions, key=str.casefold)
+        print("Current question categories: " + (", ".join(categories) if categories else "none"))
+        category = input("Category for the new concept (you may enter a future category): ").strip()
+        if not category:
+            print("A category is required.")
+            return
+        title = input("Concept title: ").strip()
+        analogy = input("A simple analogy: ").strip()
+        idea = input("Explain the central idea: ").strip()
+        example = input("Give a worked example: ").strip()
+        prompt = input("Quick-check question: ").strip()
+        choices = [choice.strip() for choice in input("Choices separated by |: ").split("|") if choice.strip()]
+        if len(choices) < 2:
+            print("Add at least two answer choices; concept not saved.")
+            return
+        try:
+            correct_choice = int(input(f"Correct choice number (1-{len(choices)}): ").strip()) - 1
+        except ValueError:
+            print("Enter a whole number; concept not saved.")
+            return
+        if not 0 <= correct_choice < len(choices):
+            print("That choice is outside the list; concept not saved.")
+            return
+        why = input("Explain the answer: ").strip()
+        visual_steps = [step.strip() for step in input(
+            "Optional interactive steps separated by | (Enter for a generic 3-step visual): "
+        ).split("|") if step.strip()]
+        if not visual_steps:
+            visual_steps = ["Start with the key idea", "Work through the example", "Check what the result means"]
+        lesson = {
+            "id": "custom-" + uuid.uuid4().hex,
+            "title": title,
+            "analogy": analogy,
+            "idea": idea,
+            "example": example,
+            "visual": "steps",
+            "visual_steps": visual_steps,
+            "check": {"prompt": prompt, "choices": choices, "answer": correct_choice, "why": why},
+        }
+        if not all((title, analogy, idea, example, prompt, why)):
+            print("Fill in each explanation field; concept not saved.")
+            return
+        normalized_category = category.casefold()
+        library.setdefault(normalized_category, []).append(lesson)
+        saved_custom = {}
+        custom_file_loaded = not (
+            os.path.exists(self.CONCEPTS_FILE) or os.path.exists(self.CONCEPTS_FILE + ".bak")
+        )
+        for path in (self.CONCEPTS_FILE, self.CONCEPTS_FILE + ".bak"):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as lesson_file:
+                    saved_custom = json.load(lesson_file)
+                if isinstance(saved_custom, dict):
+                    custom_file_loaded = True
+                    break
+                saved_custom = {}
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+        if not custom_file_loaded:
+            print("The saved concept file is unreadable. It was left unchanged.")
+            return
+        saved_custom.setdefault(normalized_category, []).append(lesson)
+        save_error = write_json_atomically(self.CONCEPTS_FILE, saved_custom, keep_backup=True)
+        if save_error:
+            print(f"Concept not saved: {save_error}")
+            return
+        print(f"Saved '{title}' under {category}. It will appear in Concept Studio when that category has questions.")
+
+    def get_concept_categories(self):
+        """Return every question category, whether or not lessons exist yet."""
+        return sorted(self.question_bank.questions, key=lambda category: str(category).casefold())
+
+    def show_concept_studio(self):
+        library, library_error = self.load_concept_library()
+        if library_error:
+            print(library_error)
+            return
+        available_categories = self.get_concept_categories()
+        if not available_categories:
+            print("Add questions to a category before opening Concept Studio.")
+            return
+        progress, progress_error = self.load_concept_progress()
+        if progress_error:
+            print(progress_error)
+            return
+
+        window = tk.Tk()
+        window.title("Concept Studio")
+        window.geometry("980x760")
+        window.minsize(760, 600)
+        tk.Label(window, text="Concept Studio", font=("Segoe UI", 21, "bold"), anchor="w", padx=20, pady=14).pack(fill="x")
+        tk.Label(
+            window,
+            text="Curated lessons rotate as a daily pick. Browse the library to revisit earlier ideas; add lessons for new subjects from Admin.",
+            font=("Segoe UI", 10), fg="#52606d", wraplength=920, justify="left", padx=22, pady=(0, 12),
+        ).pack(fill="x")
+
+        category_var = tk.StringVar(value=available_categories[0])
+        selector = tk.Frame(window, padx=18, pady=4)
+        selector.pack(fill="x")
+        tk.Label(selector, text="Subject:", font=("Segoe UI", 10, "bold")).pack(side="left", padx=(0, 8))
+        tk.OptionMenu(selector, category_var, *available_categories).pack(side="left")
+        body = tk.Frame(window, padx=18, pady=12)
+        body.pack(fill="both", expand=True)
+        catalog = tk.Frame(body, width=250)
+        catalog.pack(side="left", fill="y", padx=(0, 14))
+        catalog.pack_propagate(False)
+        tk.Label(catalog, text="Lessons and revisits", font=("Segoe UI", 11, "bold"), anchor="w").pack(fill="x", pady=(0, 8))
+        list_frame = tk.Frame(catalog)
+        list_frame.pack(fill="both", expand=True)
+        list_scroll = tk.Scrollbar(list_frame)
+        list_scroll.pack(side="right", fill="y")
+        lesson_list = tk.Listbox(list_frame, width=30, height=20, exportselection=False, yscrollcommand=list_scroll.set)
+        lesson_list.pack(side="left", fill="both", expand=True)
+        list_scroll.config(command=lesson_list.yview)
+        content = tk.Frame(body, padx=14, relief="groove", borderwidth=1)
+        content.pack(side="left", fill="both", expand=True)
+        footer = tk.Frame(window, padx=18, pady=12)
+        footer.pack(fill="x")
+
+        selected_lesson = {"lesson": None}
+
+        def lessons_for_category():
+            return library.get(category_var.get().casefold(), [])
+
+        def populate_catalog(select_today=False):
+            lesson_list.delete(0, "end")
+            lessons = lessons_for_category()
+            for lesson in lessons:
+                saved = progress.get(lesson["id"], {})
+                marker = "✓ " if saved.get("correct_count", 0) else "↻ " if saved.get("seen_count", 0) else "○ "
+                lesson_list.insert("end", marker + lesson["title"])
+            if lessons:
+                index = date.today().toordinal() % len(lessons) if select_today else 0
+                lesson_list.selection_set(index)
+                lesson_list.activate(index)
+                render_lesson(lessons[index])
+            else:
+                for child in content.winfo_children():
+                    child.destroy()
+                tk.Label(
+                    content,
+                    text=f"No concepts have been written for {category_var.get()} yet.\n\nAn admin can add an accurate lesson from Admin → Manage concept lessons. This subject is still available for quizzes and the learning map.",
+                    font=("Segoe UI", 12), wraplength=600, justify="left", padx=24, pady=28,
+                ).pack(fill="both", expand=True)
+
+        def save_progress(lesson, correct=None):
+            saved = progress.setdefault(lesson["id"], {"seen_count": 0, "attempts": 0, "correct_count": 0})
+            saved["last_opened"] = date.today().isoformat()
+            if correct is None:
+                saved["seen_count"] = saved.get("seen_count", 0) + 1
+            else:
+                saved["attempts"] = saved.get("attempts", 0) + 1
+                saved["last_correct"] = bool(correct)
+                if correct:
+                    saved["correct_count"] = saved.get("correct_count", 0) + 1
+            error = write_json_atomically(self.CONCEPT_PROGRESS_FILE, progress, keep_backup=True)
+            if error:
+                messagebox.showerror("Could not save concept progress", error, parent=window)
+
+        def render_visual(parent, lesson):
+            visual = lesson["visual"]
+            canvas = tk.Canvas(parent, height=205, background="#f7f6f2", highlightthickness=0)
+            canvas.pack(fill="x", padx=10, pady=(8, 2))
+            controls = tk.Frame(parent)
+            controls.pack(fill="x", padx=10, pady=(0, 8))
+            state = {"step": 0}
+
+            def draw(*_args):
+                canvas.delete("all")
+                width = max(440, canvas.winfo_width())
+                if visual == "balance":
+                    x_value = float(scale.get())
+                    left, right = 3 * x_value + 5, 20
+                    canvas.create_text(width / 2, 25, text="3x + 5 = 20 · move x to balance both sides", font=("Segoe UI", 11, "bold"))
+                    canvas.create_line(width / 2, 55, width / 2, 168, fill="#344054", width=4)
+                    for center, value, label, color in ((width * .28, left, f"Left: {left:g}", "#9ec5ab"), (width * .72, right, f"Right: {right:g}", "#c7d7e8")):
+                        extent = min(130, 25 + value * 4)
+                        canvas.create_rectangle(center - extent, 110, center + extent, 145, fill=color, outline="")
+                        canvas.create_text(center, 167, text=label, font=("Segoe UI", 10))
+                    canvas.create_text(width / 2, 77, text="Balanced" if abs(left - right) < 0.01 else f"Difference: {abs(left-right):g}", fill="#18794e" if abs(left-right) < 0.01 else "#344054", font=("Segoe UI", 10, "bold"))
+                elif visual == "function":
+                    x_value = int(scale.get())
+                    canvas.create_text(width / 2, 28, text="One rule · many inputs", font=("Segoe UI", 11, "bold"))
+                    canvas.create_rectangle(28, 75, 145, 140, fill="#e9e4d5", outline="#667085")
+                    canvas.create_text(86, 107, text=f"Input x = {x_value}", font=("Segoe UI", 10, "bold"))
+                    canvas.create_line(150, 108, width - 150, 108, arrow="last", width=2, fill="#52606d")
+                    canvas.create_rectangle(width - 145, 75, width - 28, 140, fill="#dcebe0", outline="#667085")
+                    canvas.create_text(width - 86, 107, text=f"Output = {2*x_value+1}", font=("Segoe UI", 10, "bold"))
+                    canvas.create_text(width / 2, 169, text="Rule: multiply by 2, then add 1", font=("Segoe UI", 10))
+                elif visual == "derivative":
+                    x0, y0, plot_w, plot_h = 58, 170, width - 100, 125
+                    def point(x, y):
+                        return x0 + (x + 3) / 6 * plot_w, y0 - y / 9 * plot_h
+                    canvas.create_text(width / 2, 18, text="y = x² · choose a point to see its tangent slope", font=("Segoe UI", 11, "bold"))
+                    canvas.create_line(x0, y0, x0 + plot_w, y0, fill="#98a2b3")
+                    canvas.create_line(x0 + plot_w / 2, 35, x0 + plot_w / 2, y0, fill="#d0d5dd")
+                    curve = []
+                    for step in range(61):
+                        x = -3 + step / 10
+                        curve.extend(point(x, x*x))
+                    canvas.create_line(*curve, fill="#175cd3", width=3, smooth=True)
+                    chosen = int(scale.get())
+                    px, py = point(chosen, chosen * chosen)
+                    slope = 2 * chosen
+                    left_x, right_x = -3, 3
+                    tangent = [*point(left_x, chosen*chosen+slope*(left_x-chosen)), *point(right_x, chosen*chosen+slope*(right_x-chosen))]
+                    canvas.create_line(*tangent, fill="#d97706", width=2)
+                    canvas.create_oval(px-5, py-5, px+5, py+5, fill="#d97706", outline="")
+                    canvas.create_text(width / 2, 190, text=f"At x = {chosen}, slope = 2x = {slope}", font=("Segoe UI", 10, "bold"))
+                elif visual == "variables":
+                    values = ["not set", "4", "7"]
+                    value = values[min(state["step"], 2)]
+                    canvas.create_text(width / 2, 30, text="score = 4     then     score = score + 3", font=("Consolas", 12, "bold"))
+                    canvas.create_rectangle(width/2-115, 68, width/2+115, 145, fill="#e9e4d5", outline="#667085", width=2)
+                    canvas.create_text(width/2, 88, text="score", font=("Segoe UI", 10))
+                    canvas.create_text(width/2, 120, text=value, font=("Segoe UI", 18, "bold"), fill="#175cd3")
+                    canvas.create_text(width/2, 174, text="A name points to its current value.", font=("Segoe UI", 10))
+                elif visual == "loop":
+                    turn = state["step"]
+                    totals = [0, 2, 6, 12]
+                    canvas.create_text(width / 2, 30, text="for n in [2, 4, 6]: total += n", font=("Consolas", 12, "bold"))
+                    for index, amount in enumerate((2, 4, 6)):
+                        x = width/2 - 180 + index*180
+                        color = "#dcebe0" if index < turn else "#eef0f3"
+                        canvas.create_rectangle(x, 75, x+120, 125, fill=color, outline="#98a2b3")
+                        canvas.create_text(x+60, 100, text=f"{amount}" if index != turn else f"→ {amount}", font=("Segoe UI", 12, "bold"))
+                    canvas.create_text(width / 2, 160, text=f"Loop turns: {min(turn, 3)} / 3      Running total: {totals[min(turn, 3)]}", font=("Segoe UI", 11, "bold"))
+                elif visual == "alias":
+                    items = [1] if state["step"] == 0 else [1, 2]
+                    canvas.create_text(width / 2, 25, text="a and b point to the same list", font=("Segoe UI", 11, "bold"))
+                    canvas.create_text(width*.25, 72, text="a", font=("Segoe UI", 12, "bold"))
+                    canvas.create_text(width*.75, 72, text="b", font=("Segoe UI", 12, "bold"))
+                    canvas.create_line(width*.25, 85, width/2, 115, arrow="last", fill="#52606d", width=2)
+                    canvas.create_line(width*.75, 85, width/2, 115, arrow="last", fill="#52606d", width=2)
+                    canvas.create_rectangle(width/2-90, 118, width/2+90, 162, fill="#dcebe0", outline="#667085")
+                    canvas.create_text(width/2, 140, text=f"shared list: {items}", font=("Consolas", 11, "bold"))
+                elif visual == "steps":
+                    steps = lesson.get("visual_steps") or ["Start", "Work through", "Check"]
+                    active = min(state["step"], len(steps) - 1)
+                    card_width = min(175, (width - 60) / max(1, len(steps)))
+                    gap = (width - card_width * len(steps)) / (len(steps) + 1)
+                    canvas.create_text(width / 2, 28, text="Follow the idea one step at a time", font=("Segoe UI", 11, "bold"))
+                    for index, step in enumerate(steps):
+                        left = gap + index * (card_width + gap)
+                        fill = "#dcebe0" if index == active else "#eef0f3"
+                        canvas.create_rectangle(left, 70, left + card_width, 142, fill=fill, outline="#98a2b3", width=2 if index == active else 1)
+                        canvas.create_text(left + card_width / 2, 87, text=f"Step {index + 1}", font=("Segoe UI", 9, "bold"), fill="#52606d")
+                        canvas.create_text(left + card_width / 2, 116, text=step, width=card_width - 12, justify="center", font=("Segoe UI", 10, "bold"))
+                    canvas.create_text(width / 2, 173, text=f"Current step: {active + 1} of {len(steps)}", font=("Segoe UI", 10))
+
+            if visual in ("balance", "function", "derivative"):
+                initial = 5 if visual == "balance" else 2 if visual == "derivative" else 3
+                maximum = 10 if visual in ("balance", "function") else 3
+                minimum = -3 if visual == "derivative" else 0
+                scale = tk.Scale(controls, from_=minimum, to=maximum, orient="horizontal", label="Adjust the input", command=draw, length=360)
+                scale.set(initial)
+                scale.pack()
+            else:
+                scale = None
+                def advance():
+                    step_count = len(lesson.get("visual_steps") or ["Start", "Work through", "Check"]) if visual == "steps" else 4 if visual == "loop" else 2 if visual == "alias" else 3
+                    state["step"] = (state["step"] + 1) % step_count
+                    draw()
+                tk.Button(controls, text="Run next step" if visual != "variables" else "Run next assignment", command=advance, padx=10, pady=5).pack()
+            draw()
+
+        def render_lesson(lesson):
+            already_open = selected_lesson["lesson"] is not None and selected_lesson["lesson"]["id"] == lesson["id"]
+            selected_lesson["lesson"] = lesson
+            for child in content.winfo_children():
+                child.destroy()
+            if not already_open:
+                save_progress(lesson)
+            saved = progress.get(lesson["id"], {})
+            tk.Label(content, text=lesson["title"], font=("Segoe UI", 16, "bold"), anchor="w", justify="left", wraplength=640, padx=14, pady=12).pack(fill="x")
+            lesson_text = tk.Text(content, height=8, wrap="word", font=("Segoe UI", 10), padx=12, pady=9)
+            lesson_text.pack(fill="x", padx=12)
+            lesson_text.insert("end", f"Analogy\n{lesson['analogy']}\n\nCore idea\n{lesson['idea']}\n\nWorked example\n{lesson['example']}\n")
+            lesson_text.config(state="disabled")
+            visual_frame = tk.LabelFrame(content, text="Try the visual", padx=6, pady=4)
+            visual_frame.pack(fill="x", padx=12, pady=10)
+            render_visual(visual_frame, lesson)
+            check_frame = tk.LabelFrame(content, text="Quick check — learning practice, not a graded quiz", padx=10, pady=7)
+            check_frame.pack(fill="x", padx=12, pady=(0, 12))
+            tk.Label(check_frame, text=lesson["check"]["prompt"], wraplength=630, justify="left", anchor="w").pack(fill="x", pady=(0, 5))
+            choice_var = tk.IntVar(value=-1)
+            for option_index, option in enumerate(lesson["check"]["choices"]):
+                tk.Radiobutton(check_frame, text=option, variable=choice_var, value=option_index, anchor="w").pack(fill="x", anchor="w")
+            feedback = tk.Label(check_frame, text="", wraplength=620, justify="left", anchor="w", fg="#344054")
+            feedback.pack(fill="x", pady=(5, 0))
+
+            def check_answer():
+                choice = choice_var.get()
+                if choice < 0:
+                    feedback.config(text="Choose an answer to see the explanation.")
+                    return
+                is_right = choice == lesson["check"]["answer"]
+                feedback.config(
+                    text=("That’s right. " if is_right else "Not quite. ") + lesson["check"]["why"],
+                    fg="#18794e" if is_right else "#b42318",
+                )
+                save_progress(lesson, is_right)
+                status_label.config(
+                    text=f"Opened {progress[lesson['id']].get('seen_count', 0)} time(s) · "
+                         f"quick checks correct: {progress[lesson['id']].get('correct_count', 0)}"
+                )
+
+            tk.Button(check_frame, text="Check my thinking", command=check_answer, padx=10, pady=5).pack(anchor="w", pady=(6, 0))
+            status_label = tk.Label(
+                content,
+                text=f"Opened {saved.get('seen_count', 0)} time(s) · quick checks correct: {saved.get('correct_count', 0)}",
+                font=("Segoe UI", 9), fg="#667085", anchor="w", padx=14, pady=4,
+            )
+            status_label.pack(fill="x")
+
+        def on_select(_event=None):
+            selection = lesson_list.curselection()
+            lessons = lessons_for_category()
+            if selection and selection[0] < len(lessons):
+                render_lesson(lessons[selection[0]])
+
+        def select_today():
+            populate_catalog(select_today=True)
+
+        lesson_list.bind("<<ListboxSelect>>", on_select)
+        category_var.trace_add("write", lambda *_args: populate_catalog(select_today=True))
+        tk.Button(footer, text="Open today’s pick", command=select_today, padx=12, pady=7).pack(side="left")
+        tk.Button(footer, text="Close", command=window.destroy, padx=12, pady=7).pack(side="right")
+        populate_catalog(select_today=True)
+        window.mainloop()
+
+    def practice_focus_skill(self):
+        outcomes = self.get_skill_outcomes()
+        if not outcomes:
+            print("Complete a quiz first. The learning map needs answer history before it can suggest a focus.")
+            return
+        candidates = []
+        for skill, answers in outcomes.items():
+            recent = answers[-10:]
+            accuracy = sum(recent) / len(recent)
+            if len(recent) < 3 or accuracy < 0.8:
+                candidates.append((accuracy, len(recent), skill))
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        if not candidates:
+            print("Your recent results are strong across the skills with enough attempts. Try a harder quiz or add a new skill tag in Admin.")
+            return
+
+        print("\nChoose a focus based on recent answers:")
+        for index, (accuracy, attempts, skill) in enumerate(candidates, start=1):
+            sample_note = "early estimate" if attempts < 3 else f"{accuracy:.0%} recent accuracy"
+            print(f"  {index}. {skill} — {sample_note} ({attempts} answer(s))")
+        try:
+            selected_index = int(input("Focus number: ").strip()) - 1
+        except ValueError:
+            print("Enter one of the listed numbers.")
+            return
+        if selected_index not in range(len(candidates)):
+            print("Choose one of the listed numbers.")
+            return
+
+        skill = candidates[selected_index][2]
+        focused_questions = [
+            question for question in self.all_questions()
+            if skill in self.question_skills(question)
+        ]
+        if not focused_questions:
+            print("No current questions have this skill tag. Update question tags in Admin, then try again.")
+            return
+        try:
+            count = int(input(f"How many {skill} questions? (1-{len(focused_questions)}): ").strip())
+        except ValueError:
+            print("Enter a whole number.")
+            return
+        if not 1 <= count <= len(focused_questions):
+            print(f"Choose a number from 1 to {len(focused_questions)}.")
+            return
+        selected = self.select_weighted_questions(focused_questions, count)
+        self.start_quiz(
+            f"Focus practice · {skill}",
+            "Mixed",
+            count,
+            question_set=selected,
+            mode="skill_practice",
+        )
+
     def show_progress_dashboard(self):
-        if not os.path.exists("history.json"):
-            history = []
-        else:
-            with open("history.json", "r", encoding="utf-8") as history_file:
-                history = json.load(history_file)
+        history, history_error = self.load_quiz_history()
 
         total_score = sum(attempt.get("score", 0) for attempt in history)
         total_marks = sum(attempt.get("total_marks", 0) for attempt in history)
@@ -830,6 +1451,7 @@ class Quiz:
         by_difficulty = {}
         by_confidence = {}
         by_mistake_pattern = {}
+        by_skill = {}
         for attempt in history:
             for group, key in ((by_category, attempt.get("category", "Unknown")),
                                (by_difficulty, attempt.get("difficulty", "Unknown"))):
@@ -837,6 +1459,14 @@ class Quiz:
                 stats[0] += attempt.get("score", 0)
                 stats[1] += attempt.get("total_marks", 0)
             for item in attempt.get("answer_review", []):
+                skills = item.get("skill_tags") or [
+                    f"{item.get('category', attempt.get('category', 'Unknown'))} · "
+                    f"{item.get('difficulty', attempt.get('difficulty', 'Unknown'))}"
+                ]
+                if isinstance(skills, str):
+                    skills = [skills]
+                for skill in skills:
+                    by_skill.setdefault(skill, []).append(bool(item.get("is_correct")))
                 confidence = item.get("confidence")
                 if confidence:
                     stats = by_confidence.setdefault(confidence, [0, 0])
@@ -850,9 +1480,13 @@ class Quiz:
             f"Quiz attempts: {len(history)}",
             f"Overall points accuracy: {overall:.1f}% ({total_score:g} / {total_marks:g})",
             f"Questions due for review: {len(self.get_due_questions())}",
+        ]
+        if history_error:
+            lines.append(history_error)
+        lines.extend([
             "",
             "By subject:",
-        ]
+        ])
         if by_category:
             for category, (score, marks) in sorted(by_category.items()):
                 pct = score / marks * 100 if marks else 0
@@ -866,6 +1500,26 @@ class Quiz:
                 lines.append(f"  {difficulty}: {pct:.1f}% ({score:g} / {marks:g})")
         else:
             lines.append("  No attempts yet.")
+        lines.extend(["", "Learning map (tag questions in Admin to add more detail):"])
+        if by_skill:
+            weak_skills = []
+            for skill, outcomes in sorted(by_skill.items()):
+                recent = outcomes[-10:]
+                accuracy = sum(recent) / len(recent) * 100
+                if len(recent) < 3:
+                    status = "building a baseline"
+                elif accuracy >= 80:
+                    status = "ready to stretch"
+                elif accuracy < 60:
+                    status = "focus here"
+                    weak_skills.append((accuracy, skill))
+                else:
+                    status = "developing"
+                lines.append(f"  {skill}: {accuracy:.0f}% over {len(recent)} recent answers · {status}")
+            if weak_skills:
+                lines.append(f"  Suggested next step: practise {min(weak_skills)[1]} with a focused session.")
+        else:
+            lines.append("  Complete a quiz to start a learning map.")
         lines.extend(["", "Accuracy by confidence:"])
         if by_confidence:
             labels = {"sure": "Sure", "somewhat": "Somewhat sure", "guess": "Guessed"}
@@ -899,6 +1553,30 @@ class Quiz:
             average_score = sum(latest_scores) / len(latest_scores) if latest_scores else 0
             lines.append(f"  Prompts completed: {len(opinion_entries)}")
             lines.append(f"  Average structure-signal score: {average_score:.1f}/10")
+            writing_growth = {}
+            for entry in opinion_entries:
+                revisions = entry.get("revisions", [])
+                if not revisions:
+                    continue
+                first_scores = {
+                    item.get("criterion"): item.get("score", 0)
+                    for item in revisions[0].get("criteria", [])
+                }
+                latest_scores_for_entry = {
+                    item.get("criterion"): item.get("score", 0)
+                    for item in revisions[-1].get("criteria", [])
+                }
+                for criterion in first_scores.keys() & latest_scores_for_entry.keys():
+                    totals = writing_growth.setdefault(criterion, [0, 0, 0])
+                    totals[0] += latest_scores_for_entry[criterion]
+                    totals[1] += latest_scores_for_entry[criterion] - first_scores[criterion]
+                    totals[2] += 1
+            if writing_growth:
+                lines.append("  Writing growth (latest criterion signals; change from first response):")
+                for criterion, (latest_total, change_total, attempts) in sorted(writing_growth.items()):
+                    average_latest = latest_total / attempts
+                    average_change = change_total / attempts
+                    lines.append(f"    {criterion}: {average_latest:.1f}/2 · average revision change {average_change:+.1f}")
             lines.append("  Recent takes:")
             recent_entries = opinion_entries[-5:]
             recent_scores = []
@@ -916,6 +1594,19 @@ class Quiz:
                 )
         else:
             lines.append("  No writing attempts yet. Try Today’s Take to begin.")
+
+        concept_progress, concept_error = self.load_concept_progress()
+        concept_library, _concept_library_error = self.load_concept_library()
+        active_categories = {category.casefold() for category in self.question_bank.questions}
+        concepts = [lesson for category, lessons in concept_library.items()
+                    if category.casefold() in active_categories for lesson in lessons]
+        visited_concepts = sum(bool(concept_progress.get(lesson["id"], {}).get("seen_count")) for lesson in concepts)
+        checked_concepts = sum(bool(concept_progress.get(lesson["id"], {}).get("attempts")) for lesson in concepts)
+        lines.extend(["", "Concept Studio:"])
+        if concept_error or _concept_library_error:
+            lines.append(f"  {concept_error or _concept_library_error}")
+        else:
+            lines.append(f"  Lessons opened: {visited_concepts}/{len(concepts)} · lessons with a quick-check attempt: {checked_concepts}")
 
         window = tk.Tk()
         window.title("Progress dashboard")
@@ -1282,12 +1973,20 @@ class Quiz:
         else:
             answer_entry = tk.Entry(answer_area, width=62, font=("Segoe UI", 11))
             answer_entry.pack(fill="x")
+            tk.Label(
+                answer_area,
+                text="Outer spaces and equivalent Unicode text are normalized. Case and internal spaces follow the difficulty; symbols are preserved.",
+                wraplength=500,
+                justify="left",
+                fg="#667085",
+                font=("Segoe UI", 9),
+            ).pack(fill="x", pady=(5, 0))
             answer_entry.focus_set()
-            answer_entry.bind("<Return>", lambda _event: finish(answer_entry.get().strip()))
+            answer_entry.bind("<Return>", lambda _event: finish(answer_entry.get()))
             tk.Button(
                 window,
                 text="Submit answer",
-                command=lambda: finish(answer_entry.get().strip()),
+                command=lambda: finish(answer_entry.get()),
             ).pack(pady=(4, 16))
 
         def tick():
@@ -1303,7 +2002,7 @@ class Quiz:
 
         window.after(0, tick)
         window.mainloop()
-        return answer["value"].strip()
+        return answer["value"]
 
     def ask_for_reasoning(self, question, user_answer, first_mistake_answer=None):
         """Collect the learner's approach and optional self-reported mistake pattern."""
@@ -1380,8 +2079,40 @@ class Quiz:
         window.mainloop()
         return response
 
-    def get_next_review_date(self, is_correct, confidence, was_retried=False):
-        """Schedule recently missed or retried answers for an earlier check."""
+    def load_quiz_history(self):
+        """Load quiz history, falling back to the last safe backup when needed."""
+        for path in ("history.json", "history.json.bak"):
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8") as history_file:
+                    history = json.load(history_file)
+                if isinstance(history, list):
+                    return history, None
+            except (OSError, json.JSONDecodeError, UnicodeError):
+                continue
+        if os.path.exists("history.json") or os.path.exists("history.json.bak"):
+            return [], "Quiz history and its backup could not be read. They were left unchanged."
+        return [], None
+
+    def get_question_review_streak(self, question):
+        history, error = self.load_quiz_history()
+        if error:
+            return 0
+        identity = self.question_identity(question)
+        for attempt in reversed(history):
+            if not isinstance(attempt, dict):
+                continue
+            for item in reversed(attempt.get("answer_review", [])):
+                if not isinstance(item, dict):
+                    continue
+                item_identity = (item.get("category"), item.get("difficulty"), item.get("question"))
+                if item_identity == identity:
+                    return max(0, int(item.get("review_streak", 0))) if item.get("is_correct") else 0
+        return 0
+
+    def get_next_review_date(self, is_correct, confidence, was_retried=False, previous_streak=0):
+        """Expand review intervals after clean recalls and reset after a lapse."""
         if not is_correct or was_retried:
             days_until_review = 1
         elif confidence == "guess":
@@ -1389,20 +2120,50 @@ class Quiz:
         elif confidence == "somewhat":
             days_until_review = 3
         else:
-            days_until_review = 7
+            days_until_review = min(7 * (2 ** max(0, previous_streak)), 30)
         return (date.today() + timedelta(days=days_until_review)).isoformat()
 
     def get_numeric_difference(self, question, user_answer):
         """Return submitted minus correct value when both answers are numeric."""
-        if question.question_type != "normal" or not user_answer.strip():
+        if question.question_type != "normal" or not self.normalize_answer_text(user_answer):
             return None
 
         def parse_number(value):
-            normalized = value.strip().replace("−", "-").replace(",", "")
-            if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:\s*/\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+))?", normalized):
+            normalized = self.normalize_answer_text(value)
+            normalized = normalized.replace("−", "-").replace("﹣", "-").replace("－", "-")
+            normalized = "".join(
+                str(unicodedata.decimal(character)) if character.isdecimal() else character
+                for character in normalized
+            )
+            number_parts = re.split(r"\s*/\s*", normalized)
+            if len(number_parts) > 2:
                 return None
+
+            def normalize_number_part(part):
+                part = "".join(part.split())
+                if "," in part and "." in part:
+                    if re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+\.\d+", part):
+                        part = part.replace(",", "")
+                    elif re.fullmatch(r"[+-]?\d{1,3}(?:\.\d{3})+,\d+", part):
+                        part = part.replace(".", "").replace(",", ".")
+                    else:
+                        return None
+                elif "," in part:
+                    if re.fullmatch(r"[+-]?\d{1,3}(?:,\d{3})+", part):
+                        part = part.replace(",", "")
+                    elif re.fullmatch(r"[+-]?\d+,\d+", part):
+                        part = part.replace(",", ".", 1)
+
+                if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", part):
+                    return None
+                return part
+
+            normalized_parts = [normalize_number_part(part) for part in number_parts]
+            if any(part is None for part in normalized_parts):
+                return None
+            normalized = "/".join(normalized_parts)
             try:
-                return Fraction(normalized.replace(" ", ""))
+                return Fraction(normalized)
             except (ValueError, ZeroDivisionError):
                 return None
 
@@ -1412,17 +2173,24 @@ class Quiz:
             return None
         return submitted - correct
 
+    @staticmethod
+    def normalize_answer_text(value):
+        """Normalize outer whitespace and canonical Unicode without erasing symbols."""
+        if value is None:
+            return ""
+        return unicodedata.normalize("NFC", str(value)).strip()
+
     def evaluate_answer(self, question, user_answer):
         """Grade exact, numeric, or rubric-based answers and retain actionable feedback."""
         if question.question_type == "mcq":
-            return user_answer == question.answer, {"kind": "choice"}
+            return self.rules_to_check_answer(question, user_answer), {"kind": "choice"}
 
         numeric_difference = self.get_numeric_difference(question, user_answer)
         if numeric_difference is not None:
             return numeric_difference == 0, {"kind": "numeric"}
 
         if question.feedback_criteria:
-            answer_text = user_answer.casefold()
+            answer_text = " ".join(self.normalize_answer_text(user_answer).split()).casefold()
             matched = []
             missing = []
             for aliases in question.feedback_criteria:
@@ -1443,10 +2211,11 @@ class Quiz:
 
     @staticmethod
     def contains_answer_phrase(answer_text, phrase):
-        normalized_phrase = phrase.casefold().strip()
+        normalized_text = " ".join(unicodedata.normalize("NFC", str(answer_text)).split()).casefold()
+        normalized_phrase = " ".join(unicodedata.normalize("NFC", str(phrase)).split()).casefold()
         if not normalized_phrase:
             return False
-        return re.search(r"(?<!\w)" + re.escape(normalized_phrase) + r"(?!\w)", answer_text) is not None
+        return re.search(r"(?<!\w)" + re.escape(normalized_phrase) + r"(?!\w)", normalized_text) is not None
 
     def show_question_feedback(
         self,
@@ -1684,20 +2453,22 @@ class Quiz:
             mark = mark/2 
         return mark 
     def rules_to_check_answer(self,question,user_answer): 
-          if question.question_type == "mcq": 
-              return user_answer == question.answer 
-          else: 
-              numeric_difference = self.get_numeric_difference(question, user_answer)
-              if numeric_difference is not None:
-                  return numeric_difference == 0
-              if question.difficulty == "easy": 
-                  return user_answer.lower() == question.answer.lower() 
-              elif question.difficulty == "medium": 
-                  user_answer = " ".join(user_answer.split()) 
-                  correct_answer = " ".join(question.answer.split()) 
-                  return user_answer.lower() == correct_answer.lower() 
-              else: 
-                  return user_answer.strip() == question.answer.strip() 
+          user_answer = self.normalize_answer_text(user_answer)
+          correct_answer = self.normalize_answer_text(question.answer)
+          if question.question_type == "mcq":
+              return user_answer.casefold() == correct_answer.casefold()
+
+          numeric_difference = self.get_numeric_difference(question, user_answer)
+          if numeric_difference is not None:
+              return numeric_difference == 0
+          if question.difficulty == "easy":
+              return user_answer.casefold() == correct_answer.casefold()
+          elif question.difficulty == "medium":
+              user_answer = " ".join(user_answer.split()).casefold()
+              correct_answer = " ".join(correct_answer.split()).casefold()
+              return user_answer == correct_answer
+          else:
+              return user_answer == correct_answer
  
     def get_total_marks(self): 
         total_marks = 0 
@@ -1706,35 +2477,35 @@ class Quiz:
         return total_marks     
                    
     def save_history(self,category,difficulty,total_questions,correct_answers,wrong_answers,total_marks,percentage,answer_review=None,mode="standard"):
-         
-        if not os.path.exists("history.json"): 
-                        with open("history.json", "w", encoding="utf-8") as f:
-                            json.dump([], f) 
-        with open("history.json","r", encoding="utf-8")as f:
-                                history =json.load(f) 
-                                
-                                history.append({ 
-                                "category": category, 
-                                "difficulty": difficulty, 
-                                "total_questions": total_questions, 
-                                "correct_answers": correct_answers, 
-                                "wrong_answers": wrong_answers, 
-                                "score": self.score, 
-                                "total_marks": total_marks, 
-                                "percentage": percentage,
-                                "answer_review": answer_review or [],
-                                "date": date.today().isoformat(),
-                                "mode": mode,
-                                                          }) 
-        with open("history.json", "w", encoding="utf-8") as f: 
-            json.dump(history, f, indent=4) 
+        history, error = self.load_quiz_history()
+        if error:
+            print(f"Quiz results could not be saved. {error}")
+            return False
+        history.append({
+            "category": category,
+            "difficulty": difficulty,
+            "total_questions": total_questions,
+            "correct_answers": correct_answers,
+            "wrong_answers": wrong_answers,
+            "score": self.score,
+            "total_marks": total_marks,
+            "percentage": percentage,
+            "answer_review": answer_review or [],
+            "date": date.today().isoformat(),
+            "mode": mode,
+        })
+        error = write_json_atomically("history.json", history, keep_backup=True)
+        if error:
+            print(f"Quiz results could not be saved. {error}")
+            return False
+        return True
+
     def show_history(self): 
-        quiz_counter =0 
-        if not os.path.exists("history.json"): 
-            with open("history.json","w", encoding="utf-8")as f: 
-                json.dump([],f)   
-        with open("history.json","r", encoding="utf-8")as f :  
-            history = json.load(f)       
+        quiz_counter = 0
+        history, error = self.load_quiz_history()
+        if error:
+            print(error)
+            return
         if not history:
             print("No quiz attempts yet. Start a quiz to build your history.")
             return
@@ -1758,10 +2529,9 @@ class Quiz:
 
     def get_daily_streak(self, history=None):
         if history is None:
-            if not os.path.exists("history.json"):
+            history, error = self.load_quiz_history()
+            if error:
                 return 0
-            with open("history.json", "r", encoding="utf-8") as history_file:
-                history = json.load(history_file)
 
         completed_days = {
             attempt.get("date")
@@ -1805,7 +2575,7 @@ class Quiz:
 quiz = Quiz(bank)         
  
  
-def admin_menu(bank): 
+def admin_menu(bank, quiz=None):
     while True: 
          
         choice = input(""" 
@@ -1820,6 +2590,7 @@ def admin_menu(bank):
                 8.Back 
                 9.Export Question Bank
                 10.Import Questions
+                11.Manage concept lessons
                  
                 """).strip() 
          
@@ -1833,6 +2604,9 @@ def admin_menu(bank):
             new_question_type = input("Enter your question type here:").strip().lower() 
             new_explanation = input("Enter a short explanation showing how to reach the answer: ").strip()
             new_feedback_criteria = []
+            skill_tags = [tag.strip() for tag in input(
+                "Optional skill tags, separated by commas (for the learning map): "
+            ).split(",") if tag.strip()]
                  
             if new_question_type == "mcq": 
                 options = input("Enter 4 options separated by commas: ").split(",") 
@@ -1871,6 +2645,7 @@ def admin_menu(bank):
                 new_options,
                 new_explanation,
                 new_feedback_criteria,
+                skill_tags,
             )
             bank.add_question(question) 
             print("the question has been sucesfully added::") 
@@ -1894,6 +2669,7 @@ def admin_menu(bank):
                             6.edit options 
                             7.edit explanation
                             8.edit written-answer key ideas
+                            9.edit skill tags for the learning map
                             enter your number here''').strip() 
                 if menu == "1": 
                     field = "answer" 
@@ -1960,6 +2736,13 @@ def admin_menu(bank):
                         "feedback_criteria",
                         parse_feedback_criteria(criteria_text),
                     )
+                elif menu == "9":
+                    skill_text = input("Skill tags separated by commas (Enter to clear): ")
+                    bank.edit_question(
+                        question,
+                        "skill_tags",
+                        [tag.strip() for tag in skill_text.split(",") if tag.strip()],
+                    )
                 print("chages has been succesfully taken place:")     
         elif choice == "4": 
             bank.display_questions() 
@@ -2003,6 +2786,12 @@ def admin_menu(bank):
                     print(f"Imported {imported} question(s); skipped {skipped} duplicate(s).")
                 except (OSError, ValueError) as error:
                     print(f"Could not import questions: {error}")
+
+        elif choice == "11":
+            if quiz is None:
+                print("Concept lesson management is unavailable in this menu context.")
+            else:
+                quiz.manage_concept_lessons()
  
         else : 
             print("inavlid choice:") 
@@ -2026,6 +2815,8 @@ def player_menu(quiz,question_bank):
         7. Today’s Take
         8. Past Takes
         9. Back 
+        10. Concept Studio
+        11. Practise a focus skill
  
         Enter your choice: """).strip() 
  
@@ -2082,6 +2873,12 @@ def player_menu(quiz,question_bank):
         elif choice == "8":
             quiz.show_opinion_history()
 
+        elif choice == "10":
+            quiz.show_concept_studio()
+
+        elif choice == "11":
+            quiz.practice_focus_skill()
+
         elif choice == "9":
             break 
  
@@ -2110,7 +2907,7 @@ def main_menu(bank, quiz):
         Enter your choice: """).strip() 
  
         if choice == "1": 
-            admin_menu(bank) 
+            admin_menu(bank, quiz)
  
         elif choice == "2": 
             player_menu(quiz,bank) 
