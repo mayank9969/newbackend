@@ -434,6 +434,13 @@ bank =Question_bank()
  
 class Quiz: 
     QUESTION_TIME_LIMIT = 30
+    QUESTION_TIME_LIMITS = {
+        "mcq": {"easy": 20, "medium": 30, "hard": 45},
+        "normal": {"easy": 30, "medium": 45, "hard": 60},
+        "reasoned": {"easy": 45, "medium": 60, "hard": 90},
+    }
+    DIFFICULTY_MARKS = {"easy": 2, "medium": 4, "hard": 6}
+    RETRY_CREDIT_MULTIPLIER = 0.5
     OPINION_HISTORY_FILE = "opinion_responses.json"
     CONCEPT_PROGRESS_FILE = "concept_progress.json"
     CONCEPTS_FILE = "concepts.json"
@@ -627,18 +634,22 @@ class Quiz:
                 was_retried=retried,
                 previous_streak=previous_review_streak,
             )
-            if is_correct: 
-                mark = self.get_marks(question) 
-                self.score += mark 
-                correct_answers += 1 
-            else: 
+            max_marks = self.get_marks(question)
+            retry_multiplier = self.RETRY_CREDIT_MULTIPLIER if retried else 1.0
+            earned_marks = 0.0
+            if is_correct:
+                earned_marks = max_marks * retry_multiplier
+                self.score += earned_marks
+                correct_answers += 1
+            else:
                 if answer_analysis.get("kind") == "key_ideas":
                     total_ideas = answer_analysis["total_key_ideas"]
                     matched_ideas = len(answer_analysis["matched_key_ideas"])
                     if total_ideas and matched_ideas:
-                        self.score += self.get_marks(question) * matched_ideas / total_ideas
+                        earned_marks = max_marks * matched_ideas / total_ideas * retry_multiplier
+                        self.score += earned_marks
                         partial_answers += 1
-                wrong_answers += 1 
+                wrong_answers += 1
 
             if question.question_type == "mcq":
                 submitted_answer = (
@@ -668,6 +679,8 @@ class Quiz:
                 ),
                 was_retried=retried,
                 mistake_pattern=mistake_pattern,
+                earned_marks=earned_marks,
+                max_marks=max_marks,
             )
 
             submitted_answer = self.format_submitted_answer(question, user_answer)
@@ -689,6 +702,8 @@ class Quiz:
                 "retry_correct": retry_correct,
                 "correct_answer": correct_answer,
                 "is_correct": is_correct,
+                "earned_marks": earned_marks,
+                "max_marks": max_marks,
                 "explanation": question.explanation,
                 "reasoning": reasoning,
                 "mistake_pattern": mistake_pattern,
@@ -827,7 +842,7 @@ class Quiz:
         question_count = min(5, len(question_pool))
         daily_questions = daily_rng.sample(question_pool, question_count)
         print(f"\\n========== DAILY CHALLENGE · {challenge_day} ==========")
-        print(f"Today's five-question set is fixed for the day. Each answer has {self.QUESTION_TIME_LIMIT} seconds.")
+        print("Today's five-question set is fixed for the day. Time limits vary by question type and difficulty.")
         self.start_quiz(
             "Daily Challenge",
             "Mixed",
@@ -955,6 +970,144 @@ class Quiz:
             question_set=selected,
             mode="smart_review",
         )
+
+    def get_recommended_next_session(self, history=None):
+        """Recommend a session using due reviews, recent misses, and category progress."""
+        if history is None:
+            history, error = self.load_quiz_history()
+            if error:
+                return {"title": "Progress unavailable", "reason": error, "questions": [], "mode": "recommended"}
+
+        questions = self.all_questions()
+        if not questions:
+            return {"title": "No questions available", "reason": "Add questions to the bank first.", "questions": [], "mode": "recommended"}
+
+        due = self.get_due_questions()
+        if due:
+            return {"title": "Review questions due now", "reason": f"{len(due)} question(s) are ready for spaced review.", "questions": due, "mode": "smart_review"}
+
+        by_identity = {self.question_identity(question): question for question in questions}
+        latest, attempted, outcomes = {}, set(), {}
+        for attempt in history:
+            if not isinstance(attempt, dict):
+                continue
+            attempt_category = attempt.get("category")
+            if attempt_category and attempt_category != "Mixed":
+                attempted.add(attempt_category)
+            review_items = attempt.get("answer_review") or []
+            for item in review_items:
+                if not isinstance(item, dict):
+                    continue
+                category = item.get("category") or attempt_category
+                identity = (category, item.get("difficulty"), item.get("question"))
+                if identity in by_identity:
+                    latest[identity] = item
+                if category:
+                    attempted.add(category)
+                    outcomes.setdefault(category, []).append(bool(item.get("is_correct")))
+            if not review_items and attempt_category and attempt_category != "Mixed":
+                try:
+                    total_marks = float(attempt.get("total_marks", 0))
+                    if total_marks > 0:
+                        score_ratio = float(attempt.get("score", 0)) / total_marks
+                        outcomes.setdefault(attempt_category, []).append(max(0.0, min(score_ratio, 1.0)))
+                except (TypeError, ValueError):
+                    pass
+
+        missed = [by_identity[key] for key, item in latest.items() if not item.get("is_correct", False)]
+        if missed:
+            return {"title": "Revisit recent mistakes", "reason": f"{len(missed)} question(s) were most recently answered incorrectly.", "questions": missed, "mode": "missed_review"}
+
+        by_category = {}
+        for question in questions:
+            by_category.setdefault(question.category, []).append(question)
+        unseen = sorted((name for name in by_category if name not in attempted), key=str.casefold)
+        if unseen:
+            name = unseen[0]
+            return {"title": f"Explore {name}", "reason": "You have not answered questions in this category yet.", "questions": by_category[name], "mode": "recommended"}
+        if outcomes:
+            name, results = min(
+                outcomes.items(),
+                key=lambda pair: (sum(pair[1][-20:]) / len(pair[1][-20:]), -len(pair[1]), str(pair[0]).casefold()),
+            )
+            recent = results[-20:]
+            return {"title": f"Strengthen {name}", "reason": f"Recent recorded accuracy: {sum(recent) / len(recent) * 100:.0f}%.", "questions": by_category[name], "mode": "recommended"}
+
+        name = sorted(by_category, key=str.casefold)[0]
+        return {"title": f"Start with {name}", "reason": "There is not enough history yet; begin with an available category.", "questions": by_category[name], "mode": "recommended"}
+
+    def start_recommended_next_session(self):
+        recommendation = self.get_recommended_next_session()
+        pool = recommendation["questions"]
+        print(f"\nRecommended next session: {recommendation['title']}\n{recommendation['reason']}")
+        if not pool:
+            return
+        default = min(5, len(pool))
+        raw_count = input(f"How many questions? (1-{len(pool)}, Enter for {default}): ").strip()
+        try:
+            count = int(raw_count) if raw_count else default
+        except ValueError:
+            print("Enter a whole number.")
+            return
+        if not 1 <= count <= len(pool):
+            print(f"Choose a number between 1 and {len(pool)}.")
+            return
+        self.start_quiz(
+            recommendation["title"], "Mixed", count,
+            question_set=self.select_weighted_questions(pool, count),
+            mode=recommendation["mode"],
+        )
+
+    def get_learning_milestones(self, history=None):
+        """Derive milestones from existing history without adding a new data file."""
+        if history is None:
+            history, error = self.load_quiz_history()
+            if error:
+                return [], error
+        categories, latest, comeback = set(), {}, False
+        perfect = False
+        for attempt in history:
+            if not isinstance(attempt, dict):
+                continue
+            category = attempt.get("category")
+            if category and category != "Mixed":
+                categories.add(category)
+            try:
+                marks = float(attempt.get("total_marks", 0))
+                perfect = perfect or (marks > 0 and float(attempt.get("score", 0)) >= marks)
+            except (TypeError, ValueError):
+                pass
+            for item in attempt.get("answer_review", []):
+                if not isinstance(item, dict):
+                    continue
+                category = item.get("category") or category
+                if category:
+                    categories.add(category)
+                identity = (category, item.get("difficulty"), item.get("question"))
+                correct = bool(item.get("is_correct", False))
+                if latest.get(identity) is False and correct and not item.get("retried", False):
+                    comeback = True
+                latest[identity] = correct
+        milestones = [
+            {"name": "First quiz", "detail": "Complete your first quiz.", "achieved": bool(history)},
+            {"name": "Perfect round", "detail": "Finish a quiz with full marks.", "achieved": perfect},
+            {"name": "Subject explorer", "detail": "Answer questions in three categories.", "achieved": len(categories) >= 3},
+            {"name": "Comeback", "detail": "Correct a previously missed answer without retrying.", "achieved": comeback},
+            {"name": "Three-day challenge streak", "detail": "Complete daily challenges on three consecutive days.", "achieved": self.get_daily_streak(history) >= 3},
+            {"name": "Ten sessions", "detail": "Complete ten quiz sessions.", "achieved": len(history) >= 10},
+        ]
+        return milestones, None
+
+    def show_learning_milestones(self):
+        milestones, error = self.get_learning_milestones()
+        if error:
+            print(f"Learning milestones could not be loaded: {error}")
+            return
+        earned = sum(item["achieved"] for item in milestones)
+        print(f"\n========== LEARNING MILESTONES · {earned}/{len(milestones)} ==========")
+        for item in milestones:
+            marker = "✓" if item["achieved"] else "·"
+            print(f"{marker} {item['name']} — {item['detail']}")
 
     @staticmethod
     def question_skills(question):
@@ -1481,6 +1634,15 @@ class Quiz:
             f"Overall points accuracy: {overall:.1f}% ({total_score:g} / {total_marks:g})",
             f"Questions due for review: {len(self.get_due_questions())}",
         ]
+        milestones, milestone_error = self.get_learning_milestones(history)
+        if milestone_error:
+            lines.extend(["", f"Learning milestones unavailable: {milestone_error}"])
+        else:
+            earned = sum(item["achieved"] for item in milestones)
+            lines.extend(["", f"Learning milestones: {earned}/{len(milestones)} earned"])
+            for item in milestones:
+                if item["achieved"]:
+                    lines.append(f"  ✓ {item['name']}")
         if history_error:
             lines.append(history_error)
         lines.extend([
@@ -1924,7 +2086,8 @@ class Quiz:
         window.title(f"{'Retry — ' if is_retry else 'Quiz — '}Question {question_number}")
         window.resizable(False, False)
         answer = {"value": ""}
-        remaining = self.QUESTION_TIME_LIMIT
+        time_limit = self.get_question_time_limit(question)
+        remaining = time_limit
 
         tk.Label(
             window,
@@ -1944,6 +2107,15 @@ class Quiz:
                 padx=20,
                 pady=4,
             ).pack(fill="x")
+        answer_kind = self.get_question_kind_label(question)
+        tk.Label(
+            window,
+            text=f"{question.difficulty.title()} · {answer_kind} · {time_limit} seconds",
+            font=("Segoe UI", 9),
+            fg="#667085",
+            padx=20,
+            pady=2,
+        ).pack(fill="x")
         timer_label = tk.Label(window, font=("Segoe UI", 11, "bold"), fg="#b42318")
         timer_label.pack(pady=(0, 8))
         answer_area = tk.Frame(window, padx=20, pady=8)
@@ -2232,6 +2404,8 @@ class Quiz:
         first_submitted_answer=None,
         was_retried=False,
         mistake_pattern=None,
+        earned_marks=None,
+        max_marks=None,
     ):
         """Show a correction immediately after the learner reflects on their answer."""
         window = tk.Tk()
@@ -2281,6 +2455,12 @@ class Quiz:
         if was_retried:
             feedback_text.insert("end", f"First try\n{first_submitted_answer}\n\n")
         feedback_text.insert("end", f"Your answer\n{submitted_answer}\n")
+        if earned_marks is not None and max_marks is not None:
+            retry_note = " (retry answers earn up to 50%)" if was_retried else ""
+            feedback_text.insert(
+                "end",
+                f"Marks earned: {self.format_marks(earned_marks)} / {self.format_marks(max_marks)}{retry_note}\n\n",
+            )
         if not is_correct:
             feedback_text.insert("end", f"Correct answer\n{correct_answer}\n")
         if numeric_difference is not None and numeric_difference != 0:
@@ -2387,6 +2567,11 @@ class Quiz:
             else:
                 status = "Incorrect"
             review_text.insert("end", f"{question_number}. {item.get('question', 'Question')} · {status}\n")
+            if "earned_marks" in item and "max_marks" in item:
+                review_text.insert(
+                    "end",
+                    f"Marks: {self.format_marks(item['earned_marks'])} / {self.format_marks(item['max_marks'])}\n",
+                )
             if item.get("retried"):
                 review_text.insert("end", f"First try: {item.get('first_answer', '(no answer)')}\n")
                 review_text.insert("end", f"Retry: {item.get('retry_answer', item.get('your_answer', '(no answer)'))}\n")
@@ -2446,12 +2631,38 @@ class Quiz:
  
  
                          
-    def get_marks(self,question): 
-        marks = {"easy":2,"medium":4,"hard":6} 
-        mark = marks[question.difficulty] 
-        if question.question_type == "mcq": 
-            mark = mark/2 
-        return mark 
+    def get_marks(self, question):
+        """Return the difficulty weight; question format does not change its value."""
+        difficulty = str(question.difficulty or "").strip().casefold()
+        return self.DIFFICULTY_MARKS.get(difficulty, self.DIFFICULTY_MARKS["medium"])
+
+    def get_question_kind_label(self, question):
+        if str(question.question_type).strip().casefold() == "mcq":
+            return "multiple choice"
+        if question.feedback_criteria:
+            return "explain your answer"
+        return "short answer"
+
+    def get_question_time_limit(self, question):
+        """Give more time to harder and more constructed responses."""
+        difficulty = str(question.difficulty or "").strip().casefold()
+        question_type = str(question.question_type or "").strip().casefold()
+        if question_type == "mcq":
+            time_group = "mcq"
+        elif question.feedback_criteria:
+            time_group = "reasoned"
+        else:
+            time_group = "normal"
+        return self.QUESTION_TIME_LIMITS.get(time_group, {}).get(
+            difficulty, self.QUESTION_TIME_LIMIT
+        )
+
+    @staticmethod
+    def format_marks(value):
+        value = float(value or 0)
+        if value.is_integer():
+            return str(int(value))
+        return f"{value:.2f}".rstrip("0").rstrip(".")
     def rules_to_check_answer(self,question,user_answer): 
           user_answer = self.normalize_answer_text(user_answer)
           correct_answer = self.normalize_answer_text(question.answer)
@@ -2817,6 +3028,8 @@ def player_menu(quiz,question_bank):
         9. Back 
         10. Concept Studio
         11. Practise a focus skill
+        12. Recommended next session
+        13. Learning milestones
  
         Enter your choice: """).strip() 
  
@@ -2878,6 +3091,12 @@ def player_menu(quiz,question_bank):
 
         elif choice == "11":
             quiz.practice_focus_skill()
+
+        elif choice == "12":
+            quiz.start_recommended_next_session()
+
+        elif choice == "13":
+            quiz.show_learning_milestones()
 
         elif choice == "9":
             break 
